@@ -1,0 +1,6 @@
+streamlit>=1.38
+supabase>=2.8
+httpx>=0.27
+python-dotenv>=1.0
+google-generativeai>=0.8
+openpyxl>=3.1
