@@ -426,6 +426,14 @@ def render_update_meeting_page() -> None:
     # can't be triggered by a single click. Uses soft delete — the row stays
     # in Supabase with deleted_at set, but disappears from all app views.
     #
+    # Eligibility (mirrors db.soft_delete_lead): only allowed when the lead
+    # has no meeting yet, or its meeting is currently 'Scheduled' (which is
+    # always future-dated — past Scheduleds get auto-completed elsewhere).
+    # Any other status (Completed / No-show / Cancelled / Rescheduled /
+    # Lead deleted) means real-world history exists; the advisor must
+    # update that meeting's status manually before deleting. This protects
+    # against accidentally erasing leads that produced actual events.
+    #
     # All deletes are framed as advisor errors (wrong data, duplicate, test
     # entry, etc.) — a customer canceling is NOT a delete, that goes through
     # meeting_status='Cancelled' instead. This keeps the analytics clean:
@@ -438,47 +446,61 @@ def render_update_meeting_page() -> None:
         "Other",
     ]
 
+    # Determine eligibility up front so the UI can explain *why* the delete
+    # button is unavailable instead of silently disabling it.
+    _ms = lead.get("meeting_status")
+    delete_eligible = (_ms is None) or (str(_ms).lower() == "scheduled")
+
     with st.expander("⚠️ Delete this lead", expanded=False):
-        st.caption(
-            "Soft-delete: the lead is hidden from the app but stays in Supabase "
-            "for audit. Useful if you scored the wrong lead by mistake."
-        )
-        confirm = st.checkbox(
-            f"I confirm I want to delete **{lead.get('company')}** (`{lead.get('email')}`)",
-            key="delete_confirm",
-        )
-        delete_reason = st.selectbox(
-            "Reason for deletion *",
-            DELETE_REASONS,
-            key="delete_reason",
-        )
-        delete_notes = st.text_input(
-            "Additional details (optional)",
-            key="delete_notes",
-            placeholder="e.g. Typed wrong email, duplicate of lead #12345",
-        )
-        # The button is enabled only when BOTH the confirm checkbox is ticked
-        # AND a real reason is selected (not the placeholder).
-        reason_chosen = delete_reason and delete_reason != DELETE_REASONS[0]
-        if st.button(
-            "🗑️ Delete lead",
-            type="secondary",
-            disabled=not (confirm and reason_chosen),
-        ):
-            try:
-                db.soft_delete_lead(
-                    lead["id"],
-                    reason=delete_reason,
-                    notes=delete_notes or None,
-                )
-                st.success(f"✅ Lead deleted. It will no longer appear in the app.")
-                # Clear all session state for this lead
-                for k in ("found_lead", "just_scheduled", "show_new_meeting_form",
-                          "delete_confirm", "delete_reason", "delete_notes"):
-                    st.session_state.pop(k, None)
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ Delete failed: {type(e).__name__}: {e}")
+        if not delete_eligible:
+            st.warning(
+                f"This lead can't be deleted because its meeting is "
+                f"**{_ms}**. Delete is only available for leads with no "
+                f"meeting or a meeting still scheduled in the future. "
+                f"If you really need to remove this lead, update the "
+                f"meeting status appropriately first."
+            )
+        else:
+            st.caption(
+                "Soft-delete: the lead is hidden from the app but stays in Supabase "
+                "for audit. Useful if you scored the wrong lead by mistake."
+            )
+            confirm = st.checkbox(
+                f"I confirm I want to delete **{lead.get('company')}** (`{lead.get('email')}`)",
+                key="delete_confirm",
+            )
+            delete_reason = st.selectbox(
+                "Reason for deletion *",
+                DELETE_REASONS,
+                key="delete_reason",
+            )
+            delete_notes = st.text_input(
+                "Additional details (optional)",
+                key="delete_notes",
+                placeholder="e.g. Typed wrong email, duplicate of lead #12345",
+            )
+            # The button is enabled only when BOTH the confirm checkbox is ticked
+            # AND a real reason is selected (not the placeholder).
+            reason_chosen = delete_reason and delete_reason != DELETE_REASONS[0]
+            if st.button(
+                "🗑️ Delete lead",
+                type="secondary",
+                disabled=not (confirm and reason_chosen),
+            ):
+                try:
+                    db.soft_delete_lead(
+                        lead["id"],
+                        reason=delete_reason,
+                        notes=delete_notes or None,
+                    )
+                    st.success(f"✅ Lead deleted. It will no longer appear in the app.")
+                    # Clear all session state for this lead
+                    for k in ("found_lead", "just_scheduled", "show_new_meeting_form",
+                              "delete_confirm", "delete_reason", "delete_notes"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Delete failed: {type(e).__name__}: {e}")
 
     # -------- Meeting history timeline --------
     try:

@@ -381,15 +381,43 @@ def soft_delete_lead(
     notes: str | None = None,
 ) -> dict[str, Any]:
     """
-    Soft-delete a lead by setting deleted_at = NOW() and recording WHY.
-    The row stays in scoring.lead_score (for auditability) but is filtered
-    out of all app queries (lookups, pending list, percentile calc, etc.).
+    Soft-delete a lead. The row stays in scoring.lead_score (for audit) but
+    is filtered out of all app queries (lookups, pending list, percentile
+    calc, etc.) via the deleted_at column.
 
-    meeting_history rows for the lead are left untouched — they're still
-    queryable by lead_id for analytics. We don't insert a synthetic
-    'Deleted' row in meeting_history because a delete is a lead-level
-    event, not a meeting status change (a customer canceling a meeting
-    is a different concept and uses meeting_status='Cancelled').
+    Eligibility rule
+    ----------------
+    Delete is only allowed when:
+      - The lead has NO meeting (meeting_status IS NULL), OR
+      - The lead's meeting is currently 'Scheduled' (which by design means
+        it is in the future — past-dated Scheduled rows are auto-completed
+        elsewhere in the app, so anything still 'Scheduled' has not happened
+        yet).
+
+    For any other status (Completed, No-show, Cancelled, Rescheduled,
+    Lead deleted) we raise ValueError. The advisor must update the meeting
+    status manually first if they really want to delete. This protects
+    against accidentally erasing leads that already produced a real-world
+    event (a meeting that happened, was no-showed, etc.).
+
+    Side effect on meeting_history
+    ------------------------------
+    If the lead has a Scheduled meeting, we UPDATE that row in place:
+    flip its status from 'Scheduled' to 'Lead deleted' and append a note
+    explaining the deletion. We do NOT insert a new history row.
+
+    Why update in place (instead of appending, like no-show / reschedule)?
+    Because the meeting was never real — it was created by a data-entry
+    mistake. Preserving 'this meeting was scheduled at time X' is not
+    useful audit information; it's just noise. The real audit info lives
+    on lead_score (deleted_at, delete_reason, delete_notes).
+
+    'Lead deleted' is its own status — distinct from plain 'Cancelled'.
+    A cancellation is a customer-driven event; 'Lead deleted' is advisor-
+    driven (wrong data, duplicate, test entry). Keeping them separate lets
+    analytics answer different questions:
+      - "How often do customers cancel?" → status = 'Cancelled'
+      - "How often do advisors make data-entry mistakes?" → status = 'Lead deleted'
 
     Parameters
     ----------
@@ -404,8 +432,13 @@ def soft_delete_lead(
         Free-text detail. Useful for 'Other' or when the advisor wants
         to add context to one of the predefined reasons.
 
-    Use case: advisor scored a lead by mistake (wrong data, duplicate, etc.)
-    and wants it to disappear from the app.
+    Raises
+    ------
+    ValueError
+        If reason is empty, or if the lead's current meeting_status makes
+        it ineligible for delete (see Eligibility rule above).
+    RuntimeError
+        If the lead doesn't exist or the UPDATE returns no rows.
     """
     if not reason or not reason.strip():
         raise ValueError("soft_delete_lead requires a non-empty 'reason'")
@@ -414,11 +447,73 @@ def soft_delete_lead(
     from datetime import datetime as _dt
     from datetime import timezone as _tz
 
+    now_iso = _dt.now(_tz.utc).isoformat()
+
+    # Step 1 — Look up the lead's current meeting_status, both to enforce
+    # the eligibility rule and to know whether we need to touch
+    # meeting_history at all.
+    lead_resp = (
+        client.schema(SCHEMA).table(TABLE)
+        .select("meeting_status, meeting_datetime, meeting_timezone, partner_sent_to")
+        .eq("id", lead_id)
+        .limit(1)
+        .execute()
+    )
+    if not lead_resp.data:
+        raise RuntimeError(f"Lead id={lead_id} not found")
+    current = lead_resp.data[0]
+    current_status = current.get("meeting_status")
+
+    # Step 2 — Enforce eligibility. NULL or 'Scheduled' only.
+    if current_status is not None and str(current_status).lower() != "scheduled":
+        raise ValueError(
+            f"Cannot delete this lead: its meeting status is "
+            f"'{current_status}'. Delete is only allowed for leads with no "
+            f"meeting or with a meeting still scheduled in the future. "
+            f"If you really need to remove this lead, update the meeting "
+            f"status manually first."
+        )
+
+    # Step 3 — If the lead has a Scheduled meeting, flip the matching
+    # meeting_history row's status to 'Lead deleted' and add an explanatory
+    # note. We update in place (no new row) — see docstring for rationale.
+    if current_status and str(current_status).lower() == "scheduled":
+        cancel_note = f"Lead was deleted. Reason: {reason.strip()}"
+        if notes and notes.strip():
+            cancel_note += f". Notes: {notes.strip()}"
+
+        # Find the most recent Scheduled row for this lead — that's the
+        # active one corresponding to the current meeting on lead_score.
+        history_resp = (
+            client.schema(SCHEMA).table(MEETING_HISTORY_TABLE)
+            .select("id")
+            .eq("lead_id", lead_id)
+            .eq("meeting_status", "Scheduled")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if history_resp.data:
+            history_id = history_resp.data[0]["id"]
+            (
+                client.schema(SCHEMA).table(MEETING_HISTORY_TABLE)
+                .update({
+                    "meeting_status": "Lead deleted",
+                    "notes":          cancel_note,
+                })
+                .eq("id", history_id)
+                .execute()
+            )
+
+    # Step 4 — Soft-delete the lead row itself. Mirror the new status onto
+    # lead_score so it's consistent even outside meeting_history.
     payload = {
-        "deleted_at":    _dt.now(_tz.utc).isoformat(),
+        "deleted_at":    now_iso,
         "delete_reason": reason.strip(),
         "delete_notes":  (notes.strip() if notes and notes.strip() else None),
     }
+    if current_status and str(current_status).lower() == "scheduled":
+        payload["meeting_status"] = "Lead deleted"
 
     resp = (
         client.schema(SCHEMA).table(TABLE)
