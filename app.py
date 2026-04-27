@@ -47,6 +47,62 @@ st.set_page_config(
 )
 
 
+# ---------------------------------------------------------------------------
+# Password gate
+# ---------------------------------------------------------------------------
+# Lightweight access control for the Streamlit Community Cloud free tier
+# (which doesn't support per-email allowlists). The shared password lives
+# in st.secrets["APP_PASSWORD"] (configured in the Streamlit Cloud dashboard
+# or in local .env via app_secrets.get_secret).
+#
+# Once a session passes the gate, st.session_state["authenticated"] = True
+# and the gate is skipped on subsequent reruns within that session. Closing
+# the browser / starting a new session requires re-entering the password.
+def _check_password() -> bool:
+    """
+    Returns True if the user has already authenticated this session, or
+    if they just submitted the correct password. Returns False otherwise
+    and renders the password form.
+    """
+    if st.session_state.get("authenticated"):
+        return True
+
+    from app_secrets import get_secret
+    expected = get_secret("APP_PASSWORD")
+    if not expected:
+        # If APP_PASSWORD isn't configured at all, fail closed rather than
+        # silently letting everyone in. Surface the misconfiguration to the
+        # operator so they can set the secret.
+        st.error(
+            "🔒 App is not configured for access. "
+            "Set APP_PASSWORD in Streamlit secrets (or .env locally)."
+        )
+        return False
+
+    st.title("🏆 Renaissance Lead Scorer")
+    st.caption("Internal tool — please sign in to continue.")
+    pwd = st.text_input(
+        "Password",
+        type="password",
+        key="_pwd_input",
+        placeholder="Enter shared team password",
+    )
+    if st.button("Sign in", type="primary"):
+        if pwd == expected:
+            st.session_state["authenticated"] = True
+            # Clear the input from session_state so it doesn't persist.
+            st.session_state.pop("_pwd_input", None)
+            st.rerun()
+        else:
+            st.error("Wrong password. Try again.")
+    return False
+
+
+if not _check_password():
+    st.stop()
+# ---------------------------------------------------------------------------
+
+
 # Load scoring tables once per session. Cached so reruns don't re-read disk.
 @st.cache_resource
 def load_scoring_tables() -> dict:
@@ -760,11 +816,14 @@ st.sidebar.markdown("---")
 # re-running on every rerun.
 if not st.session_state.get("_auto_complete_ran"):
     try:
-        db.auto_complete_past_meetings()
+        n_completed = db.auto_complete_past_meetings()
         st.session_state["_auto_complete_ran"] = True
-    except Exception:
-        # Silent failure — don't clutter the sidebar. If it keeps failing,
-        # the meetings simply stay in 'Scheduled' until the next session.
+        # TEMPORARY DEBUG — show in sidebar how many meetings got auto-completed
+        # this pass. Remove once we're confident the sweep is working.
+        st.sidebar.caption(f"🔄 Auto-complete: {n_completed} meeting(s) updated")
+    except Exception as e:
+        # TEMPORARY DEBUG — surface the error instead of swallowing it.
+        st.sidebar.error(f"Auto-complete failed: {type(e).__name__}: {e}")
         st.session_state["_auto_complete_ran"] = True
 
 # Pending meetings alert — shows only leads scored from today onward that
