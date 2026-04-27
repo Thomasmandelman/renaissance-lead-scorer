@@ -32,9 +32,13 @@ RPC_PERCENTILE = "get_percentile"
 @lru_cache(maxsize=1)
 def _client() -> Client:
     """Single process-wide client. Reused across Streamlit reruns."""
+    # Local dev: load .env if present. On Streamlit Cloud .env doesn't exist
+    # and load_dotenv is a no-op, but require_secret will read from
+    # st.secrets[...] there — so the same code works in both environments.
     load_dotenv()
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_SERVICE_KEY"]
+    from app_secrets import require_secret
+    url = require_secret("SUPABASE_URL")
+    key = require_secret("SUPABASE_SERVICE_KEY")
     return create_client(url, key)
 
 

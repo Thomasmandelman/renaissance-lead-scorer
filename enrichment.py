@@ -48,9 +48,14 @@ load_dotenv()
 # Config
 # ----------------------------------------------------------------------------
 
-GEMINI_KEY  = os.environ.get("GEMINI_API_KEY")
-PLACES_KEY  = os.environ.get("GOOGLE_PLACES_API_KEY")
-APOLLO_KEY  = os.environ.get("APOLLO_API_KEY")
+# Read API keys via the centralized helper. This works the same when
+# running locally (loads from .env) and on Streamlit Cloud (loads from
+# st.secrets). Using .get equivalents (returns None if missing) so the
+# module imports cleanly even when one provider is not configured.
+from app_secrets import get_secret as _get_secret
+GEMINI_KEY  = _get_secret("GEMINI_API_KEY")
+PLACES_KEY  = _get_secret("GOOGLE_PLACES_API_KEY")
+APOLLO_KEY  = _get_secret("APOLLO_API_KEY")
 
 GEMINI_MODEL      = "gemini-2.5-flash"       # grounded + reasoning (industry/TIB/location)
 GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"  # grounded + simple enum (digital presence, job title)
