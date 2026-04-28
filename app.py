@@ -31,7 +31,6 @@ import reply_features
 import scoring
 from enrichment import (
     AllApisFailedError,
-    LeadOutsideUSAError,
     enrich_lead,
 )
 
@@ -214,9 +213,6 @@ def render_score_lead_page() -> None:
                 reply_ts_utc=reply_ts_utc,
                 reply_text=reply_text,
             )
-        except LeadOutsideUSAError as e:
-            st.error(f"❌ {e}\n\nLead NOT saved.")
-            return
         except AllApisFailedError as e:
             st.error(f"❌ All external APIs failed. Lead NOT saved.\n\n{e}")
             return
@@ -230,6 +226,7 @@ def render_score_lead_page() -> None:
     partner    = result.get("partner")
 
     st.success("✅ Lead saved")
+
     score_txt      = f"{score_raw:.1f}" if score_raw is not None else "—"
     percentile_txt = f"top {percentile:.2f}%" if percentile is not None else "—"
     st.markdown(
@@ -345,6 +342,7 @@ def _score_and_save(
         "lead_id":   saved.get("id"),
         "score_raw": scored["score_raw"],
         "percentile": percentile,
+        "enrichment_outside_usa": enriched.enrichment_outside_usa,
     }
 
 

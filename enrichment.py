@@ -10,7 +10,14 @@ Design principles:
   1. A missing data point (e.g. "no LinkedIn page") is NOT an error — it's a
      valid False/None that flows through to the scoring. Only *technical*
      failures (auth, rate limits, API down) get reported as errors.
-  2. USA-only. Any country != "United States" aborts with LeadOutsideUSAError.
+  2. USA-only by IM pre-filter. Inbox Managers verify the lead is USA before
+     they hit "Score". When the enrichment cascade can't confirm USA we trust
+     the IM and proceed anyway, but flag the result via
+     EnrichmentResult.enrichment_outside_usa=True. The features most likely to
+     be wrong (state + digital-presence signals) are neutralized in
+     to_scoring_features() so the score stays honest. The legacy
+     LeadOutsideUSAError class is kept for compatibility but no longer raised
+     by enrich_lead().
   3. Parallel where possible (asyncio.gather), sequential only where there's
      a data dependency (find_website must complete before Apollo starts).
   4. Each API call returns (value, ApiCallStatus). The caller composes these
@@ -188,9 +195,40 @@ class EnrichmentResult:
     # Metadata
     resolved_website: str | None = None   # The website actually used (input or Gemini-found)
     statuses: list[ApiCallStatus] = field(default_factory=list)
+    # Outside-USA fallback flag.
+    # When True, the enrichment cascade concluded the company is not in the USA.
+    # We do NOT block scoring — instead we trust the IM (who pre-filters leads)
+    # and assume the enrichment misidentified the company (e.g. matched a
+    # same-named company in another country). The features that are most likely
+    # to be wrong (state and digital-presence signals) are neutralized in
+    # to_scoring_features() so they don't contaminate the score.
+    enrichment_outside_usa: bool = False
 
     def to_scoring_features(self) -> dict[str, Any]:
-        """Produce the dict format expected by scoring.compute_score()."""
+        """Produce the dict format expected by scoring.compute_score().
+
+        When enrichment_outside_usa is True, the state is forced to None
+        (resolves to bucket "Unknown" → neutral score 50) and all digital-
+        presence signals are forced to False (so the +0..6 bonus becomes 0).
+        Industry / employees / TIB / locations / seniority are kept as-is —
+        they are usually directionally correct even when the country is not.
+        """
+        if self.enrichment_outside_usa:
+            return {
+                "industry":          self.industry,
+                "years_in_business": self.years_in_business,
+                "employees":         self.employees,
+                "state":             None,
+                "num_locations":     self.num_locations,
+                "job_title":         self.job_title,
+                # Digital presence: don't trust signals from a wrong-country match
+                "has_website":    False,
+                "has_gmb":        False,
+                "has_linkedin":   False,
+                "has_facebook":   False,
+                "has_instagram":  False,
+                "has_trustpilot": False,
+            }
         return {
             "industry":          self.industry,
             "years_in_business": self.years_in_business,
@@ -1391,8 +1429,10 @@ async def enrich_lead(
     Enrich a lead. Company + email + first_name + last_name are mandatory.
     Website is optional; if missing, Gemini will try to find it.
 
-    Returns EnrichmentResult. Raises LeadOutsideUSAError if country != US, or
-    AllApisFailedError if every API failed technically.
+    Returns EnrichmentResult. Never raises LeadOutsideUSAError anymore — when
+    the cascade can't confirm USA, sets result.enrichment_outside_usa=True
+    instead and continues with neutralized state + digital-presence signals.
+    Still raises AllApisFailedError if every API failed technically.
     """
     result = EnrichmentResult()
 
@@ -1614,14 +1654,19 @@ async def enrich_lead(
 
         # USA-only guard
         # ---------- STEP 5: Validate — USA-only cascade ----------
-        # The business rule: accept the lead if the company operates in the USA,
-        # even if its headquarters is elsewhere. Cascade:
+        # The business rule used to reject non-USA leads outright. New rule
+        # (Apr 2026): IMs already pre-filter for USA before scoring, so when
+        # the cascade can't confirm USA we trust the IM and proceed anyway —
+        # but we flag the lead and neutralize the features most likely to be
+        # contaminated by a wrong-country match (state + digital presence).
+        # See EnrichmentResult.to_scoring_features() for the neutralization.
+        # The cascade itself stays the same:
         #   1) Primary Gemini said USA → accept.
         #   2) Primary Gemini said another country → re-ask Gemini whether the
         #      company has USA operations (and in which state).
         #   3) Primary Gemini said null → use Places data if it found a USA
         #      match (city/state/country from address components).
-        #   4) Nothing indicates USA presence → reject.
+        #   4) Nothing indicates USA presence → flag and continue (don't reject).
 
         primary_country = (result.country or "").strip().lower()
         is_usa = primary_country in ("united states", "usa", "us", "united states of america")
@@ -1646,8 +1691,20 @@ async def enrich_lead(
                     note=f"Primary said {primary_country!r}, but company has USA ops in {result.state}",
                 ))
             else:
-                # Re-check said no USA ops — genuine non-USA lead, reject
-                raise LeadOutsideUSAError(result.country)
+                # Re-check said no USA ops — flag lead, drop location to NULL,
+                # and let scoring proceed with neutralized features.
+                result.enrichment_outside_usa = True
+                result.country = None
+                result.state = None
+                result.city = None
+                result.statuses.append(ApiCallStatus(
+                    api="Validation: country", status="no_data", duration_ms=0,
+                    note=(
+                        f"Enrichment said {primary_country!r}, USA re-check failed. "
+                        "Trusting IM pre-filter; scoring with state + digital "
+                        "presence neutralized."
+                    ),
+                ))
 
         else:
             # Primary returned null for country — rely on Places
@@ -1662,8 +1719,19 @@ async def enrich_lead(
                     note=f"Country resolved via Places fallback → {result.state}",
                 ))
             else:
-                # No signal at all — reject (can't confirm USA)
-                raise LeadOutsideUSAError(None)
+                # No signal at all — flag lead and continue, same as the
+                # non-USA branch above.
+                result.enrichment_outside_usa = True
+                result.country = None
+                result.state = None
+                result.city = None
+                result.statuses.append(ApiCallStatus(
+                    api="Validation: country", status="no_data", duration_ms=0,
+                    note=(
+                        "No country signal from any source. Trusting IM pre-filter; "
+                        "scoring with state + digital presence neutralized."
+                    ),
+                ))
 
         # If EVERY technical call failed, abort — we can't score blindly
         tech_fails = sum(1 for s in result.statuses if s.status == "tech_fail")
@@ -1739,12 +1807,12 @@ if __name__ == "__main__":
         print("#" * 72)
         try:
             result = await enrich_lead(**sample)
-        except LeadOutsideUSAError as e:
-            print(f"✗ {e}")
-            return
         except AllApisFailedError as e:
             print(f"✗ {e}")
             return
+
+        if result.enrichment_outside_usa:
+            print("⚠️  enrichment_outside_usa flag set — scoring with neutralized state + digital presence")
 
         print("\n--- FEATURES ---")
         for k, v in asdict(result).items():
