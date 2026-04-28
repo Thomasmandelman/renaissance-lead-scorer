@@ -125,6 +125,13 @@ def render_score_lead_page() -> None:
     st.title("🏆 Score Lead")
     st.caption("Fill in the lead's details. The system enriches, scores, and tells you which partner to send them to.")
 
+    # If we're in the middle of a duplicate-resolution flow, render the
+    # dialog instead of the form. The IM picks an action, we run the
+    # pipeline accordingly, and clear the pending state.
+    if st.session_state.get("duplicate_pending"):
+        _render_duplicate_dialog()
+        return
+
     # Form fields (kept in session_state so they persist across spinner reruns)
     with st.form(key="score_form", clear_on_submit=False):
         st.subheader("📝 Lead details")
@@ -194,25 +201,59 @@ def render_score_lead_page() -> None:
 
     # Compose the UTC timestamp from the date + hour + minute inputs.
     from datetime import time as _time
-    reply_ts_utc = datetime.combine(
+    reply_dt_utc = datetime.combine(
         reply_date,
         _time(int(reply_hour), int(reply_minute), 0),
-    ).replace(tzinfo=timezone.utc).isoformat()
+    ).replace(tzinfo=timezone.utc)
 
-    # -------- Run the pipeline --------
+    # Reject reply timestamps in the future. Common entry mistake: typing
+    # next year, or picking tomorrow by accident on the date picker. We
+    # compare the full timestamp (date + hour + minute) since a reply at
+    # 11pm UTC today is fine but a reply at 3am tomorrow is not.
+    now_utc = datetime.now(timezone.utc)
+    if reply_dt_utc > now_utc:
+        st.error(
+            f"❌ Reply date can't be in the future. "
+            f"You entered {reply_dt_utc.strftime('%Y-%m-%d %H:%M')} UTC, "
+            f"which is after the current time."
+        )
+        return
+
+    reply_ts_utc = reply_dt_utc.isoformat()
+
+    # Pack the form payload — used for both the immediate-insert path and
+    # (if duplicate is detected) the deferred path that runs after the IM
+    # picks Correct/New entry from the dialog.
+    form_data = {
+        "company":     company.strip(),
+        "website":     website.strip() or None,
+        "email":       email.strip().lower(),
+        "first_name":  first_name.strip(),
+        "last_name":   last_name.strip(),
+        "phone":       phone.strip(),
+        "advisor":     advisor.strip(),
+        "reply_ts_utc": reply_ts_utc,
+        "reply_text":  reply_text,
+    }
+
+    # -------- Duplicate check (BEFORE running the expensive pipeline) --------
+    # If the email already has an active row in lead_score, we don't insert
+    # blindly — we let the IM decide whether to correct the existing record
+    # or create a new engagement. The pipeline (enrichment + scoring) only
+    # runs after the IM picks an action, to avoid wasting API calls if they
+    # cancel.
+    existing = db.find_active_lead_by_email(form_data["email"])
+    if existing is not None:
+        st.session_state["duplicate_pending"] = {
+            "form_data": form_data,
+            "existing":  existing,
+        }
+        st.rerun()
+
+    # -------- Run the pipeline (no duplicate, just save) --------
     with st.spinner("Scoring lead… this can take around 25 seconds"):
         try:
-            result = _score_and_save(
-                company=company.strip(),
-                website=website.strip() or None,
-                email=email.strip().lower(),
-                first_name=first_name.strip(),
-                last_name=last_name.strip(),
-                phone=phone.strip(),
-                advisor=advisor.strip(),
-                reply_ts_utc=reply_ts_utc,
-                reply_text=reply_text,
-            )
+            result = _score_and_save(**form_data, mode="insert")
         except AllApisFailedError as e:
             st.error(f"❌ All external APIs failed. Lead NOT saved.\n\n{e}")
             return
@@ -236,6 +277,231 @@ def render_score_lead_page() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Duplicate detection — dialog rendered when the same email already exists
+# ---------------------------------------------------------------------------
+
+# Statuses that mean the previous engagement is "closed" — i.e. the meeting
+# already happened (or was definitively cancelled) and Correcting the row
+# in place no longer makes sense. In those cases we only let the IM create
+# a new entry or cancel.
+_CLOSED_MEETING_STATUSES = {
+    "Completed", "No-show", "Cancelled",
+    "Rescheduled", "Rescheduled (correction)",
+    "Lead deleted",
+}
+
+
+def _format_existing_summary(existing: dict) -> str:
+    """Build the markdown summary block shown at the top of the dialog."""
+    scored_at = existing.get("scored_at")
+    scored_str = "—"
+    days_ago_str = ""
+    if scored_at:
+        try:
+            scored_dt = datetime.fromisoformat(scored_at.replace("Z", "+00:00"))
+            scored_str = scored_dt.strftime("%B %d, %Y")
+            days_ago = (datetime.now(timezone.utc) - scored_dt).days
+            if days_ago == 0:
+                days_ago_str = " (today)"
+            elif days_ago == 1:
+                days_ago_str = " (1 day ago)"
+            else:
+                days_ago_str = f" ({days_ago} days ago)"
+        except Exception:
+            pass
+
+    meeting_status = existing.get("meeting_status") or "No meeting yet"
+    meeting_dt    = existing.get("meeting_datetime")
+    meeting_tz    = existing.get("meeting_timezone")
+    meeting_str   = meeting_status
+    if meeting_dt and meeting_tz and meeting_status not in (None, "", "Lead deleted"):
+        try:
+            tz_iana = MEETING_TIMEZONES.get(meeting_tz, "UTC")
+            local_dt = datetime.fromisoformat(
+                meeting_dt.replace("Z", "+00:00")
+            ).astimezone(ZoneInfo(tz_iana))
+            meeting_str = (
+                f"{meeting_status} "
+                f"({local_dt.strftime('%B %d, %I:%M %p')} {meeting_tz})"
+            )
+        except Exception:
+            pass
+
+    return (
+        f"**📋 Existing record:**\n\n"
+        f"- **Company:** {existing.get('company') or '—'}\n"
+        f"- **Email:** {existing.get('email')}\n"
+        f"- **Scored:** {scored_str}{days_ago_str}\n"
+        f"- **Routed to:** {existing.get('partner_sent_to') or existing.get('partner') or '—'}\n"
+        f"- **Meeting status:** {meeting_str}"
+    )
+
+
+def _render_duplicate_dialog() -> None:
+    """
+    Render the duplicate-resolution dialog. Pulls the pending payload from
+    session_state, shows the existing record summary, and lets the IM pick
+    Correct / New entry / Cancel.
+    """
+    pending   = st.session_state["duplicate_pending"]
+    form_data = pending["form_data"]
+    existing  = pending["existing"]
+
+    st.warning("⚠️ This lead is already in the database")
+    st.markdown(_format_existing_summary(existing))
+    st.markdown("---")
+
+    meeting_status = (existing.get("meeting_status") or "").strip()
+    meeting_is_closed = meeting_status in _CLOSED_MEETING_STATUSES
+
+    # Build the option list dynamically. When the previous meeting is closed,
+    # 'Correct' is hidden because it no longer applies — the engagement is
+    # already finished.
+    options: list[tuple[str, str, str]] = []  # (key, label, description)
+
+    if not meeting_is_closed:
+        options.append((
+            "correct",
+            "Correct the existing record",
+            "Replaces the existing entry with the new data.\n\n"
+            "Use this if the previous entry contained incorrect information.",
+        ))
+
+    options.append((
+        "new",
+        "Create a new entry (separate engagement)",
+        (
+            "Adds a new entry. The previous one is preserved as historical "
+            "record. Both entries will exist for this email."
+            if not meeting_is_closed
+            else "Adds a new entry for this email. The previous one is "
+                 "preserved as historical record."
+        )
+        + "\n\nUse this if the client is re-engaging after a previous "
+          "meeting or booking.",
+    ))
+
+    options.append((
+        "cancel",
+        "Cancel",
+        "Nothing is saved. Returns to the score page.",
+    ))
+
+    if meeting_is_closed:
+        st.info(
+            "This client previously had a meeting that has already been "
+            "completed or closed."
+        )
+
+    # Render each option as its own labeled button so the IM can read the
+    # full description before clicking. Streamlit's radio is too cramped
+    # for multi-line descriptions.
+    st.markdown("**What would you like to do?**")
+    for key, label, description in options:
+        st.markdown("---")
+        st.markdown(f"### {label}")
+        st.markdown(description)
+        if st.button(label, key=f"dup_action_{key}", type="primary"):
+            _handle_duplicate_choice(key, form_data, existing)
+            return
+
+
+def _handle_duplicate_choice(
+    choice: str,
+    form_data: dict,
+    existing: dict,
+) -> None:
+    """
+    Apply the IM's decision from the duplicate dialog. Runs the full
+    enrichment + scoring pipeline only for 'correct' and 'new' (cancel
+    is free).
+    """
+    if choice == "cancel":
+        st.session_state.pop("duplicate_pending", None)
+        st.info("Cancelled. No changes were saved.")
+        st.rerun()
+        return
+
+    if choice == "correct":
+        with st.spinner("Re-scoring lead… this can take around 25 seconds"):
+            try:
+                result = _score_and_save(
+                    **form_data,
+                    mode="update",
+                    update_lead_id=existing["id"],
+                )
+            except AllApisFailedError as e:
+                st.error(f"❌ All external APIs failed. Lead NOT updated.\n\n{e}")
+                return
+            except Exception as e:
+                st.error(f"❌ Unexpected error: {type(e).__name__}: {e}\n\nLead NOT updated.")
+                return
+
+        st.session_state.pop("duplicate_pending", None)
+        st.success("✅ Existing lead corrected")
+
+        # Partner-changed warning. If the lead has an active Scheduled meeting
+        # AND the new recommended partner differs from the partner the meeting
+        # was actually booked with, warn the IM. We don't change the meeting
+        # silently — the client already has an invitation with the old
+        # partner, so the IM has to decide whether to reschedule.
+        old_partner_sent_to = existing.get("partner_sent_to")
+        new_partner = result.get("partner")
+        meeting_status = (existing.get("meeting_status") or "").strip()
+        meeting_is_active_scheduled = meeting_status == "Scheduled"
+
+        if (
+            meeting_is_active_scheduled
+            and old_partner_sent_to
+            and new_partner
+            and old_partner_sent_to != new_partner
+        ):
+            st.warning(
+                f"⚠️ **Recommended partner changed: "
+                f"{old_partner_sent_to} → {new_partner}**\n\n"
+                f"The current meeting is still booked with "
+                f"**{old_partner_sent_to}**. If you want to switch partners, "
+                f"go to **Update Meeting** and reschedule with the new partner "
+                f"(use *'Rescheduled — client moved the date'* as the reason "
+                f"if you've coordinated the change with the client, or "
+                f"*'Wrong date entered'* if it's just a routing fix)."
+            )
+
+        _show_result_summary(result)
+        return
+
+    if choice == "new":
+        with st.spinner("Scoring new engagement… this can take around 25 seconds"):
+            try:
+                result = _score_and_save(**form_data, mode="insert")
+            except AllApisFailedError as e:
+                st.error(f"❌ All external APIs failed. Lead NOT saved.\n\n{e}")
+                return
+            except Exception as e:
+                st.error(f"❌ Unexpected error: {type(e).__name__}: {e}\n\nLead NOT saved.")
+                return
+
+        st.session_state.pop("duplicate_pending", None)
+        st.success("✅ New engagement saved (previous record preserved)")
+        _show_result_summary(result)
+        return
+
+
+def _show_result_summary(result: dict) -> None:
+    """Same score/percentile/partner panel used after a normal save."""
+    score_raw  = result.get("score_raw")
+    percentile = result.get("percentile")
+    partner    = result.get("partner")
+    score_txt      = f"{score_raw:.1f}" if score_raw is not None else "—"
+    percentile_txt = f"top {percentile:.2f}%" if percentile is not None else "—"
+    st.markdown(
+        f"**Score:** {score_txt}  \n"
+        f"**Percentile:** {percentile_txt}  \n"
+        f"**Send to:** {partner or '—'}"
+    )
+
+
 def _score_and_save(
     *,
     company: str,
@@ -247,12 +513,26 @@ def _score_and_save(
     advisor: str,
     reply_ts_utc: str,
     reply_text: str,
+    mode: str = "insert",
+    update_lead_id: int | None = None,
 ) -> dict:
     """
     Orchestrate: enrichment -> reply_features -> scoring -> percentile ->
-    partner -> insert to Supabase. Returns a small dict with 'partner' at
+    partner -> persist to Supabase. Returns a small dict with 'partner' at
     minimum (that's what the UI shows).
+
+    Two persistence modes:
+      - mode='insert' (default): INSERT a new row into lead_score
+      - mode='update': UPDATE the row with id=update_lead_id in place,
+                       keeping the same id, meetings, and any related rows
+                       in funded_events. Used by the duplicate-resolution
+                       flow when the IM picks 'Correct the existing record'.
     """
+    if mode not in ("insert", "update"):
+        raise ValueError(f"mode must be 'insert' or 'update', got {mode!r}")
+    if mode == "update" and update_lead_id is None:
+        raise ValueError("mode='update' requires update_lead_id")
+
     tables = load_scoring_tables()
 
     # 1) Enrich (runs all external APIs)
@@ -287,7 +567,8 @@ def _score_and_save(
     # 6) Partner routing
     partner = pick_partner(percentile, tables)
 
-    # 7) Build the row to insert. Matches scoring.lead_scores schema.
+    # 7) Build the row payload. Same schema for both INSERT and UPDATE —
+    # the only difference is which db function we hand it to.
     row = {
         # Identity & operational
         "company":     company,
@@ -334,8 +615,12 @@ def _score_and_save(
         # if you need the funded flag joined per lead.
     }
 
-    # 8) Insert into Supabase
-    saved = db.insert_lead(row)
+    # 8) Persist
+    if mode == "insert":
+        saved = db.insert_lead(row)
+    else:
+        # update mode: keep the same id and any meetings already attached
+        saved = db.update_lead_in_place(update_lead_id, row)
 
     return {
         "partner":   partner,
@@ -507,7 +792,20 @@ def render_update_meeting_page() -> None:
     _ms = lead.get("meeting_status")
     delete_eligible = (_ms is None) or (str(_ms).lower() == "scheduled")
 
-    with st.expander("⚠️ Delete this lead", expanded=False):
+    # Keep the expander open across reruns if the IM has already started
+    # interacting with it (ticked the confirm box or picked a reason). This
+    # prevents the annoying behavior where clicking the checkbox collapses
+    # the panel and the IM has to re-open it.
+    delete_expander_open = bool(
+        st.session_state.get("delete_confirm")
+        or (
+            st.session_state.get("delete_reason")
+            and st.session_state.get("delete_reason") != DELETE_REASONS[0]
+        )
+        or st.session_state.get("delete_notes")
+    )
+
+    with st.expander("⚠️ Delete this lead", expanded=delete_expander_open):
         if not delete_eligible:
             st.warning(
                 f"This lead can't be deleted because its meeting is "
