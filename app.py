@@ -329,10 +329,12 @@ def _score_and_save(
         # partner_sent_to defaults to the recommended partner; can be overridden
         # via the 'Update Meeting' page if the advisor routes differently.
         "partner_sent_to": partner,
-        # Funding-related columns stay default/null (they're for the historical
-        # dataset). funded=False and high_value=False by default.
-        "funded": False,
-        "high_value": False,
+        # NOTE: funded/funded_amount/funded_at/fast_fund/high_value/days_to_fund
+        # used to live on this table from the original 22k historical import.
+        # They are NOT inserted from the MVP — funding outcomes now live in
+        # scoring.funded_events (a separate table, populated when partners
+        # report funded deals). Use the VIEW scoring.lead_score_with_funded
+        # if you need the funded flag joined per lead.
     }
 
     # 8) Insert into Supabase

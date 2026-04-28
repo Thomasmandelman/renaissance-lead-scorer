@@ -528,9 +528,9 @@ def soft_delete_lead(
 
 def health_check() -> dict[str, Any]:
     """
-    Cheap read that exercises the three things the MVP relies on:
+    Cheap read that exercises the things the MVP relies on:
       - Supabase connectivity
-      - SELECT permission on scoring.lead_scores
+      - SELECT permission on scoring.lead_score and scoring.funded_events
       - RPC call on scoring.get_percentile
     Returns a summary dict; raises on any failure.
     """
@@ -539,16 +539,18 @@ def health_check() -> dict[str, Any]:
         client.schema(SCHEMA).table(TABLE)
         .select("*", count="exact", head=True).execute().count
     )
-    funded = (
-        client.schema(SCHEMA).table(TABLE)
-        .select("*", count="exact", head=True)
-        .eq("funded", True).execute().count
+    # Funded outcomes now live in scoring.funded_events (one row per funded
+    # event — a single lead can have multiple). Count distinct lead_ids that
+    # have at least one funded event matched to an active lead.
+    funded_events_total = (
+        client.schema(SCHEMA).table("funded_events")
+        .select("*", count="exact", head=True).execute().count
     )
     pct_at_72 = get_percentile(72)
     return {
-        "total_leads":   total,
-        "funded_leads":  funded,
-        "pct_at_score_72": round(pct_at_72, 2),
+        "total_leads":         total,
+        "funded_events_total": funded_events_total,
+        "pct_at_score_72":     round(pct_at_72, 2),
     }
 
 
