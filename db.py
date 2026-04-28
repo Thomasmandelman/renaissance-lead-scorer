@@ -268,18 +268,35 @@ def reschedule_meeting(
     new_meeting_datetime_utc: str,
     meeting_timezone: str,
     partner_sent_to: str | None = None,
+    previous_status: str = "No-show",
 ) -> dict[str, Any]:
     """
     Reschedule a lead's meeting: marks the CURRENT (most recent) open
-    meeting_history row as 'No-show' if it's still Scheduled, then inserts
-    a new meeting_history row with the new datetime, and updates lead_score
-    to point at the new meeting.
+    meeting_history row with `previous_status` if it's still Scheduled, then
+    inserts a new meeting_history row with the new datetime, and updates
+    lead_score to point at the new meeting.
 
-    If the current meeting was already Completed/No-show/Cancelled, it is
-    left untouched — we only insert the new meeting on top.
+    `previous_status` is what actually happened with the previous meeting.
+    Valid values:
+      - 'No-show'                  — client didn't show up
+      - 'Rescheduled'              — client asked to move the date
+      - 'Rescheduled (correction)' — IM is fixing a wrong date entry
+    Defaults to 'No-show' for backwards compatibility but the UI always
+    requires the IM to pick one explicitly.
+
+    If the current meeting was already Completed/No-show/Cancelled/Rescheduled,
+    it is left untouched — we only insert the new meeting on top.
 
     Returns the new meeting_history row.
     """
+    VALID_PREVIOUS = {
+        "No-show", "Rescheduled", "Rescheduled (correction)",
+    }
+    if previous_status not in VALID_PREVIOUS:
+        raise ValueError(
+            f"previous_status must be one of {VALID_PREVIOUS}, got {previous_status!r}"
+        )
+
     client = _client()
 
     # Only overwrite the previous meeting's status if it was still open.
@@ -296,7 +313,7 @@ def reschedule_meeting(
         if prev.get("meeting_status") == "Scheduled":
             (
                 client.schema(SCHEMA).table(MEETING_HISTORY_TABLE)
-                .update({"meeting_status": "No-show"})
+                .update({"meeting_status": previous_status})
                 .eq("id", prev["id"])
                 .execute()
             )

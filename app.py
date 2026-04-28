@@ -602,7 +602,7 @@ def render_update_meeting_page() -> None:
     if not has_meeting:
         # First-ever scheduling
         st.info("No meeting scheduled yet. Use the form below to schedule the first one.")
-        _render_schedule_form(lead, is_reschedule=False)
+        _render_schedule_form(lead, is_reschedule=False, previous_meeting_open=False)
         return
 
     if current_status == "Scheduled":
@@ -616,7 +616,10 @@ def render_update_meeting_page() -> None:
         if action.startswith("Update"):
             _render_status_update_form(lead)
         else:
-            _render_schedule_form(lead, is_reschedule=True)
+            # The meeting being replaced is still open ("Scheduled"), so we
+            # need the IM to tell us what happened with it before the
+            # rescheduling submit goes through.
+            _render_schedule_form(lead, is_reschedule=True, previous_meeting_open=True)
         return
 
     # Meeting already closed (Completed / No-show / Cancelled)
@@ -640,7 +643,10 @@ def render_update_meeting_page() -> None:
     if action == "Change the status":
         _render_status_update_form(lead)
     else:
-        _render_schedule_form(lead, is_reschedule=True)
+        # The previous meeting is already closed (Completed/No-show/Cancelled/
+        # Rescheduled), so there's nothing to update on it — we're just adding
+        # a new meeting on top. No reason selectbox needed.
+        _render_schedule_form(lead, is_reschedule=True, previous_meeting_open=False)
 
 
 def _render_status_update_form(lead: dict) -> None:
@@ -664,11 +670,48 @@ def _render_status_update_form(lead: dict) -> None:
             st.error(f"❌ Update failed: {type(e).__name__}: {e}")
 
 
-def _render_schedule_form(lead: dict, *, is_reschedule: bool) -> None:
+# Mapping from the UI label to the DB meeting_status value for the previous
+# meeting when the IM is rescheduling an open ("Scheduled") meeting.
+RESCHEDULE_REASONS = {
+    "No-show — client didn't show up":           "No-show",
+    "Rescheduled — client moved the date":       "Rescheduled",
+    "Wrong date entered — fixing data entry":    "Rescheduled (correction)",
+}
+
+
+def _render_schedule_form(
+    lead: dict,
+    *,
+    is_reschedule: bool,
+    previous_meeting_open: bool,
+) -> None:
     """Form to schedule a new meeting (first or rescheduled) with numeric
-    date/time fields and a timezone dropdown."""
+    date/time fields and a timezone dropdown.
+
+    When `previous_meeting_open=True` the form requires the IM to pick what
+    happened with the previous meeting before the submit goes through. The
+    selected reason becomes the `meeting_status` of the previous row.
+    """
     verb = "Reschedule" if is_reschedule else "Schedule"
     st.markdown(f"### {verb} meeting")
+
+    # If we're rescheduling an open meeting, ask why before showing the
+    # date/time fields. The IM has to pick a reason explicitly — there is
+    # no default — so it can't be skipped accidentally.
+    previous_status = None
+    if previous_meeting_open:
+        st.caption(
+            "Tell us what happened with the previous meeting first — "
+            "this updates its status correctly."
+        )
+        reason_label = st.selectbox(
+            "What happened with the previous meeting? *",
+            options=["- Select reason -"] + list(RESCHEDULE_REASONS.keys()),
+            key="reschedule_reason",
+        )
+        if reason_label != "- Select reason -":
+            previous_status = RESCHEDULE_REASONS[reason_label]
+
     st.caption("Enter the time as it appears on the partner's invitation (e.g. '15:00 ET').")
 
     # Date: YYYY / MM / DD as three numeric fields
@@ -728,7 +771,15 @@ def _render_schedule_form(lead: dict, *, is_reschedule: bool) -> None:
     )
 
     if st.button(f"💾 {verb} meeting", type="primary"):
-        # Validate all fields present
+        # Validate reason was picked when rescheduling an open meeting
+        if previous_meeting_open and previous_status is None:
+            st.error(
+                "Please select what happened with the previous meeting "
+                "before rescheduling."
+            )
+            return
+
+        # Validate all date/time fields present
         missing = [name for name, v in [
             ("Year", m_year), ("Month", m_month), ("Day", m_day),
             ("Hour", m_hour), ("Minute", m_minute),
@@ -764,7 +815,18 @@ def _render_schedule_form(lead: dict, *, is_reschedule: bool) -> None:
         # Call the right backend function
         try:
             if is_reschedule:
-                db.reschedule_meeting(lead["id"], utc_dt, m_tz, sent_to)
+                # If the previous meeting is open, pass the IM's chosen status
+                # so reschedule_meeting() can update it correctly. Otherwise
+                # the previous meeting is already closed — let the function
+                # use its default (which won't be applied anyway since the
+                # row is no longer "Scheduled").
+                if previous_meeting_open:
+                    db.reschedule_meeting(
+                        lead["id"], utc_dt, m_tz, sent_to,
+                        previous_status=previous_status,
+                    )
+                else:
+                    db.reschedule_meeting(lead["id"], utc_dt, m_tz, sent_to)
             else:
                 db.create_meeting(lead["id"], utc_dt, m_tz, sent_to)
         except Exception as e:
@@ -784,6 +846,7 @@ def _render_schedule_form(lead: dict, *, is_reschedule: bool) -> None:
         st.session_state["found_lead"] = db.find_lead_by_email(lead["email"])
         st.session_state["just_scheduled"] = True
         st.session_state.pop("show_new_meeting_form", None)
+        st.session_state.pop("reschedule_reason", None)
         st.rerun()
 
 
