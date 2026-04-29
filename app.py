@@ -577,12 +577,17 @@ def _score_and_save(
         "first_name":  first_name,
         "last_name":   last_name,
         "phone_number": phone,
+        "advisor":     advisor,
         "date":          reply_ts_utc[:10],       # reply date
         "reply_timestamp": reply_ts_utc,
         "first_reply":     reply_text,
         "local_hour":    local_hour,
         "time_bucket":   time_bucket,
         # meeting_datetime stays NULL — set via 'Update Meeting' page later
+        # workspace / our_email / campaign live in lead_score but are NOT
+        # collected in the MVP form (would add too much friction). They are
+        # populated via periodic CSV imports from the IMs' tracking sheet.
+        # New rows from the MVP leave them NULL until the next bulk update.
         # Enrichment features
         "city":              enriched.city,
         "state":             enriched.state,
